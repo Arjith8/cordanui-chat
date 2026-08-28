@@ -7,8 +7,12 @@ pcall(function()
   if cord and cord.services and cord.services.is_running and cord.services.start then
     local ok, running = pcall(cord.services.is_running, "cordanui-agents")
     if ok and not running then
-      pcall(cord.services.start, "cordanui-agents")
-      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: auto-started cordanui-agents") end
+      local ok2, err = pcall(cord.services.start, "cordanui-agents")
+      if not ok2 and cord and cord.ui and cord.ui.notify then
+        pcall(cord.ui.notify, { message = "failed to auto-start cordanui-agents: " .. tostring(err), level = "error" })
+      elseif ok2 and cordanui and cordanui.log then
+        pcall(cordanui.log.info, "cordanui-chat: auto-started cordanui-agents")
+      end
     end
   end
 end)
@@ -345,33 +349,42 @@ local function openChat()
   pcall(function()
     if cord and cord.services and cord.services.is_running and cord.services.start then
       local ok, running = pcall(cord.services.is_running, "cordanui-agents")
-      if ok and not running then pcall(cord.services.start, "cordanui-agents") end
+      if ok and not running then
+        local ok2, err = pcall(cord.services.start, "cordanui-agents")
+        if not ok2 and cord and cord.ui and cord.ui.notify then
+          pcall(cord.ui.notify, { message = "failed to auto-start cordanui-agents: " .. tostring(err), level = "error" })
+        end
+      end
     end
   end)
-  -- explicit backend check — always runs even when getModels cache hits, so user sees status on every open
+  -- explicit backend check — status is returned as command result so it isn't
+  -- clobbered by the host's `poll_command_results` overwriting a separate `notify`.
+  local backend_status = "unknown"
   pcall(function()
-    if cord and cord.ui and cord.ui.notify then
-      if not (cord.services and cord.services.is_running) then
-        local msg = "agent backend not active: cord.services unavailable — host does not support services"
-        pcall(cord.ui.notify, { message = msg, level = "error" })
-        if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
-        return
-      end
-      local ok, running = pcall(cord.services.is_running, "cordanui-agents")
-      if ok and running then
-        pcall(cord.ui.notify, { message = "agent backend active", level = "info" })
-        if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat open: backend active") end
-      else
-        -- ok==false means is_running threw (e.g. unknown service after uninstall) — also treat as not active
-        local detail = (not ok) and (" (" .. tostring(running) .. ")") or ""
-        local msg = "agent backend not active: cordanui-agents is not running" .. detail .. " — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
-        pcall(cord.ui.notify, { message = msg, level = "error" })
-        if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
-      end
+    if not (cord.services and cord.services.is_running) then
+      local msg = "agent backend not active: cord.services unavailable"
+      backend_status = "backend unavailable"
+      if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
+      return
+    end
+    local ok, running = pcall(cord.services.is_running, "cordanui-agents")
+    if ok and running then
+      backend_status = "backend active"
+      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat open: backend active") end
+    else
+      local detail = (not ok) and (" (" .. tostring(running) .. ")") or ""
+      local msg = "agent backend not active: cordanui-agents is not running" .. detail
+      backend_status = "backend not running"
+      if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
     end
   end)
-  -- pre-warm models cache (non-blocking best effort)
-  pcall(getModels)
+  -- pre-warm models cache (best effort) — result folded into final return
+  local prewarm_ok, prewarm_models = pcall(getModels)
+  if prewarm_ok and prewarm_models and #prewarm_models > 0 then
+    backend_status = backend_status .. " — " .. #prewarm_models .. " model(s)"
+  elseif backend_status:find("not running") then
+    backend_status = backend_status .. " — no models (backend down)"
+  end
   if cord and cord.ui and cord.ui.show_panel then
     cord.ui.show_panel{
       title = "Chat — cordanui-chat",
@@ -381,7 +394,7 @@ local function openChat()
   else
     if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: cord.ui.show_panel not available (headless)") end
   end
-  return "chat opened"
+  return "chat opened — " .. backend_status
 end
 
 local function clearChat()
