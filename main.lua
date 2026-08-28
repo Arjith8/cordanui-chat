@@ -82,34 +82,49 @@ end
 -- ---------------------------------------------------------------------------
 local function getModels()
   local now = os.time()
-  if cached_models and (now - cached_at) < 300 then
+  if cached_models and (now - cached_at) < 300 and type(cached_models) == "table" and #cached_models > 0 then
     return cached_models
   end
 
-  -- prefer backend
+  -- prefer backend when available
   if cord and cord.services and cord.services.is_running then
     local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
+    if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: is_running=" .. tostring(running) .. " ok=" .. tostring(ok_running)) end
     if ok_running and running then
       local ok, res = pcall(cord.services.request, "cordanui-agents", { method = "GET", path = "/models" })
+      if cordanui and cordanui.log then
+        pcall(cordanui.log.info, "cordanui-chat getModels: request ok=" .. tostring(ok) .. " status=" .. tostring(res and res.status) .. " body=" .. tostring(res and res.body and res.body:sub(1,200) or "nil"))
+      end
       if ok and res and res.status == 200 and res.body then
         local ok2, list = pcall(cordanui.json.decode, res.body)
         if ok2 and type(list) == "table" and #list > 0 then
           cached_models = list -- [{id, provider, display}]
           cached_at = now
+          if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned " .. #list .. " models") end
           return list
+        elseif ok2 and type(list) == "table" then
+          if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned empty list, using fallback") end
         end
       end
       if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: /models via service failed, fallback") end
-      -- invalidate cache on error
-      cached_models = nil
     end
+  else
+    if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: services not available, using fallback") end
   end
 
-  -- fallback: build from default_model (static, no provider knowledge)
+  -- fallback: always at least one entry so picker is never empty
   local def = cfg("default_model", "grok-code")
-  local fallback = { { id = def, provider = "direct", display = def .. " (direct)" } }
+  if not def or def == "" then def = "grok-code" end
+  -- also include secondary option from manifest so user always has a choice even offline
+  local fallback = {
+    { id = def, provider = "direct", display = def .. " (direct)" },
+  }
+  -- add the other manifest option if different, so /model always shows choices
+  local other = (def == "grok-code") and "gemini-3-pro" or "grok-code"
+  fallback[#fallback + 1] = { id = other, provider = "direct", display = other .. " (direct)" }
   cached_models = fallback
   cached_at = now
+  if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: fallback " .. #fallback .. " models") end
   return fallback
 end
 
@@ -283,16 +298,28 @@ local function on_key(key)
         return true
       elseif draft == "/model" then
         draft = ""
-        -- trigger picker async (don't block panel key handler long)
         local models = getModels()
+        if not models or #models == 0 then
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "no models available", level = "warn" }) end
+          if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat /model: getModels returned empty") end
+          return true
+        end
         local items = {}
-        for _, m in ipairs(models) do items[#items + 1] = m.display or m.id end
+        for _, m in ipairs(models) do items[#items + 1] = m.display or m.id or tostring(m) end
+        if #items == 0 then
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "no models available", level = "warn" }) end
+          return true
+        end
         if cord and cord.ui and cord.ui.pick then
           local ok, idx = pcall(cord.ui.pick, { title = "Model", items = items })
-          if ok and idx and models[idx] then
+          if not ok then
+            if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "pick failed: " .. tostring(idx), level = "error" }) end
+          elseif idx and models[idx] then
             save_model(models[idx].id)
             if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "model: " .. models[idx].id) end
           end
+        else
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "pick not available (headless). models: " .. table.concat(items, ", "), level = "warn" }) end
         end
         return true
       else
@@ -360,8 +387,10 @@ end
 
 local function pickModel()
   local models = getModels()
+  if not models or #models == 0 then return "no models available" end
   local items = {}
-  for _, m in ipairs(models) do items[#items + 1] = m.display or m.id end
+  for _, m in ipairs(models) do items[#items + 1] = m.display or m.id or tostring(m) end
+  if #items == 0 then return "no models available" end
   if not (cord and cord.ui and cord.ui.pick) then
     return "pick not available (headless). models: " .. table.concat(items, ", ")
   end
@@ -369,7 +398,7 @@ local function pickModel()
   if not ok then return "pick failed: " .. tostring(idx) end
   if not idx then return "cancelled" end
   local m = models[idx]
-  if m then
+  if m and m.id then
     save_model(m.id)
     return "model: " .. m.id
   end
