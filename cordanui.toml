@@ -11,19 +11,6 @@ command = true
 agent = false
 theme = false
 
-[[field]]
-key = "default_model"
-label = "Default model"
-type = "select"
-options = ["grok-code", "gemini-3-pro"]
-default = "grok-code"
-
-[[field]]
-key = "system_prompt"
-label = "System prompt"
-type = "text"
-default = "You are a helpful assistant for goal tracking."
-
 [[help]]
 title = "Chat"
 text = """

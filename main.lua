@@ -114,6 +114,7 @@ local function getModels()
           cached_models = list -- [{id, provider, display}]
           cached_at = now
           if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned " .. #list .. " models") end
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "agent backend active: " .. #list .. " model(s) available", level = "info" }) end
           return list
         elseif ok2 and type(list) == "table" then
           if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned empty list") end
@@ -320,6 +321,20 @@ local function openChat()
     if cord and cord.services and cord.services.is_running and cord.services.start then
       local ok, running = pcall(cord.services.is_running, "cordanui-agents")
       if ok and not running then pcall(cord.services.start, "cordanui-agents") end
+    end
+  end)
+  -- explicit backend check — always runs even when getModels cache hits, so user sees status on every open
+  pcall(function()
+    if cord and cord.services and cord.services.is_running and cord.ui and cord.ui.notify then
+      local ok, running = pcall(cord.services.is_running, "cordanui-agents")
+      if ok and running then
+        pcall(cord.ui.notify, { message = "agent backend active", level = "info" })
+        if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat open: backend active") end
+      elseif ok then
+        local msg = "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+        pcall(cord.ui.notify, { message = msg, level = "error" })
+        if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
+      end
     end
   end)
   -- pre-warm models cache (non-blocking best effort)
