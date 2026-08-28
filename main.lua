@@ -4,6 +4,9 @@ plugin = {}
 local history = {}
 local draft = ""
 local sending = false
+local selected_model = nil
+local cached_models = nil
+local cached_at = 0
 
 -- ---------------------------------------------------------------------------
 -- helpers: config
@@ -25,27 +28,8 @@ local function cfg(key, def)
   return v
 end
 
-local function api_key()
-  local k = cfg("api_key", nil)
-  if k and k ~= "" then return k end
-  if cordanui and cordanui.config and cordanui.config.api_key and cordanui.config.api_key ~= "" then
-    return cordanui.config.api_key
-  end
-  -- env fallback
-  local env = nil
-  if os and os.getenv then
-    env = os.getenv("OPENCODE_API_KEY")
-    if (not env or env == "") then env = os.getenv("OPENAI_API_KEY") end
-    local api_key_env = cfg("api_key_env", nil)
-    if (not env or env == "") and api_key_env and api_key_env ~= "" then
-      env = os.getenv(api_key_env)
-    end
-  end
-  return env
-end
-
 -- ---------------------------------------------------------------------------
--- persistence
+-- persistence: history + selected model
 -- ---------------------------------------------------------------------------
 local function load_history()
   local raw = nil
@@ -80,8 +64,58 @@ local function save_history()
   end
 end
 
+local function load_model()
+  local m = cfg("chat.model", nil) or cfg("default_model", "grok-code")
+  selected_model = m
+end
+
+local function save_model(m)
+  selected_model = m
+  if cord and cord.config and cord.config.set then
+    pcall(cord.config.set, "chat.model", m)
+  end
+end
+
 -- ---------------------------------------------------------------------------
--- LLM
+-- models: via backend GET /models, cached 5m
+-- per CHAT-AGENTS-BACKEND-SPEC.md §2.2
+-- ---------------------------------------------------------------------------
+local function getModels()
+  local now = os.time()
+  if cached_models and (now - cached_at) < 300 then
+    return cached_models
+  end
+
+  -- prefer backend
+  if cord and cord.services and cord.services.is_running then
+    local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
+    if ok_running and running then
+      local ok, res = pcall(cord.services.request, "cordanui-agents", { method = "GET", path = "/models" })
+      if ok and res and res.status == 200 and res.body then
+        local ok2, list = pcall(cordanui.json.decode, res.body)
+        if ok2 and type(list) == "table" and #list > 0 then
+          cached_models = list -- [{id, provider, display}]
+          cached_at = now
+          return list
+        end
+      end
+      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: /models via service failed, fallback") end
+      -- invalidate cache on error
+      cached_models = nil
+    end
+  end
+
+  -- fallback: build from default_model (static, no provider knowledge)
+  local def = cfg("default_model", "grok-code")
+  local fallback = { { id = def, provider = "direct", display = def .. " (direct)" } }
+  cached_models = fallback
+  cached_at = now
+  return fallback
+end
+
+-- ---------------------------------------------------------------------------
+-- LLM: backend POST /chat + direct fallback
+-- per CHAT-AGENTS-BACKEND-SPEC.md §2.3
 -- ---------------------------------------------------------------------------
 local function build_messages()
   local system_prompt = cfg("system_prompt", "You are a helpful assistant for goal tracking.")
@@ -93,129 +127,112 @@ local function build_messages()
   return msgs
 end
 
-local function do_llm_request()
-  local key = api_key()
-  if not key or key == "" then
-    local msg = "missing api_key: run Configure on cordanui-chat or set OPENCODE_API_KEY"
-    if cord and cord.ui and cord.ui.notify then
-      pcall(cord.ui.notify, { message = msg, level = "error" })
-    end
-    if cordanui and cordanui.log then pcall(cordanui.log.error, msg) end
-    sending = false
-    return
+-- chat → backend: backend injects api_key from settings, chat only sends model+messages
+local function viaBackend(model, messages)
+  if not (cord and cord.services and cord.services.is_running) then return nil end
+  local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
+  if not (ok_running and running) then return nil end
+
+  local ok, res = pcall(cord.services.request, "cordanui-agents", {
+    method = "POST",
+    path = "/chat",
+    headers = { ["content-type"] = "application/json" },
+    body = { model = model, messages = messages, temperature = 0.7 },
+  })
+  if not ok or not res then return nil, "backend request failed: " .. tostring(res) end
+  if res.status ~= 200 then return nil, "backend HTTP " .. tostring(res.status) end
+  local ok2, parsed = pcall(cordanui.json.decode, res.body)
+  if not ok2 then return nil, "invalid JSON from backend" end
+  if parsed.error then
+    local detail = parsed.detail and (": " .. parsed.detail) or ""
+    return nil, parsed.error .. detail
   end
+  return parsed.content, parsed.usage
+end
 
-  local base = cfg("base_url", "https://opencode.ai/zen/v1")
-  -- trim trailing slash
-  if base:sub(-1) == "/" then base = base:sub(1, -2) end
-  local model = cfg("default_model", "grok-code")
-  local messages = build_messages()
-
-  -- check if backend service is running — optional delegation
-  local via_service = false
-  if cord and cord.services and cord.services.is_running then
-    local ok, running = pcall(cord.services.is_running, "cordanui-agents")
-    if ok and running then
-      via_service = true
-    end
-  end
-
-  if via_service then
-    -- Attempt service delegation; if anything fails fall back to direct.
-    local ok, res = pcall(cord.services.request, "cordanui-agents", {
-      method = "POST",
-      path = "/chat",
-      body = { model = model, messages = messages },
-    })
-    if ok and res and res.status == 200 and res.body then
-      local pok, parsed = pcall(cordanui.json.decode, res.body)
-      if pok and parsed then
-        local content = nil
-        if parsed.content then content = parsed.content
-        elseif parsed.choices and parsed.choices[1] and parsed.choices[1].message then
-          content = parsed.choices[1].message.content
-        elseif parsed.output_text then content = parsed.output_text
-        end
-        if content then
-          history[#history + 1] = { role = "assistant", content = content, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
-          save_history()
-          sending = false
-          return
-        end
-      end
-    end
-    -- fall through to direct on any service error
-    if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: service delegation failed, falling back to direct HTTP") end
-  end
-
-  -- direct HTTP
+-- fallback direct HTTP (only when backend absent). Keeps chat usable serverless.
+-- Uses env OPENCODE_API_KEY if present; no provider discovery here.
+local function do_direct_http(model, messages)
   if not (cordanui and cordanui.http and cordanui.http.request) then
-    local msg = "http not available in this host"
-    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-    sending = false
-    return
+    return nil, "http not available in this host"
   end
-
+  -- direct fallback still needs a key, but chat does not declare [[field]] api_key anymore;
+  -- rely on env (backend would have handled settings provider.*). This is best-effort.
+  local key = nil
+  if os and os.getenv then
+    key = os.getenv("OPENCODE_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+  end
+  if not key or key == "" then
+    -- also try cordanui.config if user still has legacy key
+    if cordanui and cordanui.config and cordanui.config.api_key and cordanui.config.api_key ~= "" then
+      key = cordanui.config.api_key
+    end
+  end
+  if not key or key == "" then
+    return nil, "missing api_key: backend not running and OPENCODE_API_KEY not set"
+  end
+  local base = cfg("base_url", "https://opencode.ai/zen/v1")
+  if base:sub(-1) == "/" then base = base:sub(1, -2) end
   local body_ok, body = pcall(cordanui.json.encode, { model = model, messages = messages, temperature = 0.7 })
-  if not body_ok then
-    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "failed to encode request", level = "error" }) end
-    sending = false
-    return
-  end
-
+  if not body_ok then return nil, "failed to encode request" end
   local url = base .. "/chat/completions"
   local ok, res = pcall(cordanui.http.request, {
     url = url,
     method = "POST",
-    headers = {
-      ["content-type"] = "application/json",
-      ["authorization"] = "Bearer " .. key,
-    },
+    headers = { ["content-type"] = "application/json", ["authorization"] = "Bearer " .. key },
     body = body,
   })
-
-  if not ok then
-    local msg = "chat request failed: " .. tostring(res)
-    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-    if cordanui and cordanui.log then pcall(cordanui.log.error, msg) end
-    sending = false
-    return
-  end
-
+  if not ok then return nil, "chat request failed: " .. tostring(res) end
   if not res or res.status ~= 200 then
-    local status = res and res.status or "unknown"
-    local snippet = ""
-    if res and res.body then snippet = res.body:sub(1, 200) end
-    local msg = "chat failed HTTP " .. tostring(status) .. ": " .. snippet
-    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-    if cordanui and cordanui.log then pcall(cordanui.log.error, msg) end
-    sending = false
-    return
+    local snippet = res and res.body and res.body:sub(1, 200) or ""
+    return nil, "chat failed HTTP " .. tostring(res and res.status or "unknown") .. ": " .. snippet
   end
-
   local pok, parsed = pcall(cordanui.json.decode, res.body)
-  if not pok or not parsed then
-    local msg = "chat: invalid JSON response"
-    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-    sending = false
-    return
-  end
-
+  if not pok or not parsed then return nil, "invalid JSON response" end
   local content = nil
   if parsed.choices and parsed.choices[1] and parsed.choices[1].message and parsed.choices[1].message.content ~= nil then
     content = parsed.choices[1].message.content
-  elseif parsed.content then
-    -- generic fallback
-    if type(parsed.content) == "string" then content = parsed.content
-    elseif type(parsed.content) == "table" and parsed.content[1] and parsed.content[1].text then content = parsed.content[1].text
-    end
+  elseif parsed.content and type(parsed.content) == "string" then
+    content = parsed.content
   end
+  if content == nil then return nil, "missing content in response" end
+  return content, parsed.usage
+end
 
-  if content == nil then
-    local msg = "chat: missing content in response"
-    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-    sending = false
-    return
+local function do_llm_request()
+  local model = selected_model or cfg("default_model", "grok-code") or "grok-code"
+  local messages = build_messages()
+
+  local content, usage_or_err = viaBackend(model, messages)
+  if not content then
+    local err = usage_or_err
+    -- if backend gave an error (e.g. missing api_key: configure provider-zen), surface it and don't silently fallback
+    -- but if backend was simply not running (viaBackend returned nil with no error), try direct
+    local backend_running = false
+    if cord and cord.services and cord.services.is_running then
+      local ok, r = pcall(cord.services.is_running, "cordanui-agents")
+      backend_running = ok and r
+    end
+    if backend_running then
+      -- backend was running but returned error → show it
+      local msg = err or "backend error"
+      if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
+      if cordanui and cordanui.log then pcall(cordanui.log.error, "cordanui-chat viaBackend: " .. msg) end
+      sending = false
+      -- invalidate models cache on unknown model
+      if msg and msg:find("unknown model") then cached_models = nil end
+      return
+    end
+    -- backend not running → fallback direct
+    if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: backend not running, trying direct HTTP") end
+    content, usage_or_err = do_direct_http(model, messages)
+    if not content then
+      local msg = usage_or_err or "direct request failed"
+      if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
+      if cordanui and cordanui.log then pcall(cordanui.log.error, msg) end
+      sending = false
+      return
+    end
   end
 
   history[#history + 1] = { role = "assistant", content = content, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
@@ -231,6 +248,8 @@ local function draw()
   for _, m in ipairs(history) do
     items[#items + 1] = m.role .. ": " .. m.content
   end
+  local model_label = selected_model or cfg("default_model", "grok-code")
+  local header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, Esc close, /clear wipe, /model pick"
   local draft_line
   if sending then
     draft_line = { content = "...thinking...", fg = "tertiary" }
@@ -238,7 +257,7 @@ local function draw()
     draft_line = { content = "> " .. draft, fg = "secondary" }
   end
   return {
-    { content = "Chat (" .. #history .. " msgs) — Enter send, Esc close, /clear wipe", fg = "primary", bold = true },
+    { content = header, fg = "primary", bold = true },
     { items = items, highlight = #items > 0 and #items or nil },
     draft_line,
   }
@@ -254,13 +273,27 @@ local function on_key(key)
     if sending then return true end
     if draft == "" then return true end
 
-    -- handle slash commands
+    -- slash commands
     if draft:sub(1, 1) == "/" then
       if draft == "/clear" then
         history = {}
         save_history()
         if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "history cleared") end
         draft = ""
+        return true
+      elseif draft == "/model" then
+        draft = ""
+        -- trigger picker async (don't block panel key handler long)
+        local models = getModels()
+        local items = {}
+        for _, m in ipairs(models) do items[#items + 1] = m.display or m.id end
+        if cord and cord.ui and cord.ui.pick then
+          local ok, idx = pcall(cord.ui.pick, { title = "Model", items = items })
+          if ok and idx and models[idx] then
+            save_model(models[idx].id)
+            if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "model: " .. models[idx].id) end
+          end
+        end
         return true
       else
         if cord and cord.ui and cord.ui.notify then
@@ -277,7 +310,6 @@ local function on_key(key)
     draft = ""
     sending = true
     save_history()
-    -- trigger LLM (awaitable)
     do_llm_request()
     return true
   end
@@ -287,7 +319,6 @@ local function on_key(key)
     return true
   end
 
-  -- single printable char (including space)
   if #key == 1 then
     draft = draft .. key
     return true
@@ -303,6 +334,9 @@ end
 
 local function openChat()
   load_history()
+  load_model()
+  -- pre-warm models cache (non-blocking best effort)
+  pcall(getModels)
   if cord and cord.ui and cord.ui.show_panel then
     cord.ui.show_panel{
       title = "Chat — cordanui-chat",
@@ -319,15 +353,33 @@ local function clearChat()
   history = {}
   save_history()
   if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "history cleared") end
-  -- if panel is open, it will redraw on next frame; ensure draft cleared
   draft = ""
   sending = false
   return "history cleared"
 end
 
+local function pickModel()
+  local models = getModels()
+  local items = {}
+  for _, m in ipairs(models) do items[#items + 1] = m.display or m.id end
+  if not (cord and cord.ui and cord.ui.pick) then
+    return "pick not available (headless). models: " .. table.concat(items, ", ")
+  end
+  local ok, idx = pcall(cord.ui.pick, { title = "Model", items = items })
+  if not ok then return "pick failed: " .. tostring(idx) end
+  if not idx then return "cancelled" end
+  local m = models[idx]
+  if m then
+    save_model(m.id)
+    return "model: " .. m.id
+  end
+  return "cancelled"
+end
+
 plugin.commands = {
   ["cordanui-chat.open"] = { run = openChat, desc = "Open chat" },
   ["cordanui-chat.clear"] = { run = clearChat, desc = "Clear history" },
+  ["cordanui-chat.model"] = { run = pickModel, desc = "Pick model (from cordanui-agents /models)" },
 }
 
 return plugin

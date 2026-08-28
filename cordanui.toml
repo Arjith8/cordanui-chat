@@ -12,22 +12,10 @@ agent = false
 theme = false
 
 [[field]]
-key = "api_key"
-label = "API Key"
-type = "secret"
-required = true
-
-[[field]]
-key = "base_url"
-label = "Base URL"
-type = "text"
-default = "https://opencode.ai/zen/v1"
-
-[[field]]
 key = "default_model"
 label = "Default model"
 type = "select"
-options = ["grok-code", "gpt-5", "claude-sonnet-4-5", "gemini-3-pro"]
+options = ["grok-code", "gemini-3-pro"]
 default = "grok-code"
 
 [[field]]
@@ -42,8 +30,9 @@ text = """
 Run `cordanui-chat.open` from <leader>; (command palette).
 Type message, Enter sends, Esc closes. History persists via settings and syncs via Turso.
 If cordanui-agents is running, /clear clears history.
+Models come from cordanui-agents GET /models — no provider config needed in chat.
 """
 
 [[help]]
 title = "Keys"
-text = "Enter send · Esc close · Backspace delete · /clear to wipe history"
+text = "Enter send · Esc close · Backspace delete · /clear wipe · /model to pick model"
