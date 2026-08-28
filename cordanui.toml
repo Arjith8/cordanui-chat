@@ -1,0 +1,49 @@
+runtime = "lua"
+
+[plugin]
+name = "cordanui-chat"
+version = "0.1.0"
+description = "Chat panel for cordanui"
+
+[capabilities]
+provider = false
+command = true
+agent = false
+theme = false
+
+[[field]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+
+[[field]]
+key = "base_url"
+label = "Base URL"
+type = "text"
+default = "https://opencode.ai/zen/v1"
+
+[[field]]
+key = "default_model"
+label = "Default model"
+type = "select"
+options = ["grok-code", "gpt-5", "claude-sonnet-4-5", "gemini-3-pro"]
+default = "grok-code"
+
+[[field]]
+key = "system_prompt"
+label = "System prompt"
+type = "text"
+default = "You are a helpful assistant for goal tracking."
+
+[[help]]
+title = "Chat"
+text = """
+Run `cordanui-chat.open` from <leader>; (command palette).
+Type message, Enter sends, Esc closes. History persists via settings and syncs via Turso.
+If cordanui-agents is running, /clear clears history.
+"""
+
+[[help]]
+title = "Keys"
+text = "Enter send · Esc close · Backspace delete · /clear to wipe history"
