@@ -95,13 +95,38 @@ end
 -- ---------------------------------------------------------------------------
 local function getModels()
   local now = os.time()
-  if cached_models and (now - cached_at) < 300 and type(cached_models) == "table" and #cached_models > 0 then
-    return cached_models
+  -- always verify backend still running, even on cache hit — otherwise deleting
+  -- cordanui-agents would stay hidden behind a 5m cache and user sees no error
+  local backend_ok, backend_running = false, false
+  if cord and cord.services and cord.services.is_running then
+    local ok, r = pcall(cord.services.is_running, "cordanui-agents")
+    backend_ok, backend_running = ok, r
+    if not (ok and r) then
+      -- invalidate stale cache and fall through to error path below
+      if cached_models and #cached_models > 0 then
+        cached_models = nil
+        cached_at = 0
+      end
+    elseif cached_models and (now - cached_at) < 300 and type(cached_models) == "table" and #cached_models > 0 then
+      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: cache hit " .. #cached_models .. " models, backend still active") end
+      return cached_models
+    end
+  else
+    -- no services API at all — invalidate cache
+    if cached_models and #cached_models > 0 then
+      cached_models = nil
+      cached_at = 0
+    end
   end
 
   -- backend is the only source of models — no direct fallback
   if cord and cord.services and cord.services.is_running then
-    local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
+    local ok_running, running = backend_ok, backend_running
+    -- if we already probed above, reuse; otherwise probe now (covers first call where cache was empty)
+    if backend_ok == false and backend_running == false then
+      local ok2, r2 = pcall(cord.services.is_running, "cordanui-agents")
+      ok_running, running = ok2, r2
+    end
     if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: is_running=" .. tostring(running) .. " ok=" .. tostring(ok_running)) end
     if ok_running and running then
       local ok, res = pcall(cord.services.request, "cordanui-agents", { method = "GET", path = "/models" })
@@ -325,13 +350,21 @@ local function openChat()
   end)
   -- explicit backend check — always runs even when getModels cache hits, so user sees status on every open
   pcall(function()
-    if cord and cord.services and cord.services.is_running and cord.ui and cord.ui.notify then
+    if cord and cord.ui and cord.ui.notify then
+      if not (cord.services and cord.services.is_running) then
+        local msg = "agent backend not active: cord.services unavailable — host does not support services"
+        pcall(cord.ui.notify, { message = msg, level = "error" })
+        if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
+        return
+      end
       local ok, running = pcall(cord.services.is_running, "cordanui-agents")
       if ok and running then
         pcall(cord.ui.notify, { message = "agent backend active", level = "info" })
         if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat open: backend active") end
-      elseif ok then
-        local msg = "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+      else
+        -- ok==false means is_running threw (e.g. unknown service after uninstall) — also treat as not active
+        local detail = (not ok) and (" (" .. tostring(running) .. ")") or ""
+        local msg = "agent backend not active: cordanui-agents is not running" .. detail .. " — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
         pcall(cord.ui.notify, { message = msg, level = "error" })
         if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat open: " .. msg) end
       end
