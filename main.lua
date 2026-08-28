@@ -1,5 +1,18 @@
 plugin = {}
 
+-- auto-start agents backend on install/open (callback via top-level load)
+-- This runs when TUI loads the plugin (activate) and again on each `open`.
+-- Host has no explicit on_install hook - top-level is the closest (AGENTS.md:10.2).
+pcall(function()
+  if cord and cord.services and cord.services.is_running and cord.services.start then
+    local ok, running = pcall(cord.services.is_running, "cordanui-agents")
+    if ok and not running then
+      pcall(cord.services.start, "cordanui-agents")
+      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: auto-started cordanui-agents") end
+    end
+  end
+end)
+
 -- state (Lua upvalues = view model, persists across frames)
 local history = {}
 local draft = ""
@@ -86,7 +99,7 @@ local function getModels()
     return cached_models
   end
 
-  -- prefer backend when available
+  -- backend is the only source of models — no direct fallback
   if cord and cord.services and cord.services.is_running then
     local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
     if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: is_running=" .. tostring(running) .. " ok=" .. tostring(ok_running)) end
@@ -103,34 +116,39 @@ local function getModels()
           if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned " .. #list .. " models") end
           return list
         elseif ok2 and type(list) == "table" then
-          if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned empty list, using fallback") end
+          if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: backend returned empty list") end
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "agent backend returned no models — install/activate a provider plugin", level = "warn" }) end
+          cached_models = {}
+          cached_at = now
+          return cached_models
         end
       end
-      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: /models via service failed, fallback") end
+      if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: /models via service failed") end
+      if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "agent backend error: GET /models failed", level = "error" }) end
+      cached_models = {}
+      cached_at = now
+      return cached_models
+    else
+      local msg = "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+      if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat getModels: " .. msg) end
+      if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
+      cached_models = {}
+      cached_at = now
+      return cached_models
     end
   else
-    if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: services not available, using fallback") end
+    local msg = "agent backend not active: cord.services unavailable — host does not support services"
+    if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat getModels: " .. msg) end
+    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
+    cached_models = {}
+    cached_at = now
+    return cached_models
   end
-
-  -- fallback: always at least one entry so picker is never empty
-  local def = cfg("default_model", "grok-code")
-  if not def or def == "" then def = "grok-code" end
-  -- also include secondary option from manifest so user always has a choice even offline
-  local fallback = {
-    { id = def, provider = "direct", display = def .. " (direct)" },
-  }
-  -- add the other manifest option if different, so /model always shows choices
-  local other = (def == "grok-code") and "gemini-3-pro" or "grok-code"
-  fallback[#fallback + 1] = { id = other, provider = "direct", display = other .. " (direct)" }
-  cached_models = fallback
-  cached_at = now
-  if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat getModels: fallback " .. #fallback .. " models") end
-  return fallback
 end
 
 -- ---------------------------------------------------------------------------
--- LLM: backend POST /chat + direct fallback
--- per CHAT-AGENTS-BACKEND-SPEC.md §2.3
+-- LLM: backend POST /chat only (no direct fallback)
+-- per CHAT-AGENTS-BACKEND-SPEC.md §2.3 — backend is the only transport
 -- ---------------------------------------------------------------------------
 local function build_messages()
   local system_prompt = cfg("system_prompt", "You are a helpful assistant for goal tracking.")
@@ -143,10 +161,15 @@ local function build_messages()
 end
 
 -- chat → backend: backend injects api_key from settings, chat only sends model+messages
+-- returns nil, err where err explains if backend not active vs backend error
 local function viaBackend(model, messages)
-  if not (cord and cord.services and cord.services.is_running) then return nil end
+  if not (cord and cord.services and cord.services.is_running) then
+    return nil, "agent backend not active: cord.services unavailable"
+  end
   local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
-  if not (ok_running and running) then return nil end
+  if not (ok_running and running) then
+    return nil, "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+  end
 
   local ok, res = pcall(cord.services.request, "cordanui-agents", {
     method = "POST",
@@ -165,89 +188,19 @@ local function viaBackend(model, messages)
   return parsed.content, parsed.usage
 end
 
--- fallback direct HTTP (only when backend absent). Keeps chat usable serverless.
--- Uses env OPENCODE_API_KEY if present; no provider discovery here.
-local function do_direct_http(model, messages)
-  if not (cordanui and cordanui.http and cordanui.http.request) then
-    return nil, "http not available in this host"
-  end
-  -- direct fallback still needs a key, but chat does not declare [[field]] api_key anymore;
-  -- rely on env (backend would have handled settings provider.*). This is best-effort.
-  local key = nil
-  if os and os.getenv then
-    key = os.getenv("OPENCODE_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-  end
-  if not key or key == "" then
-    -- also try cordanui.config if user still has legacy key
-    if cordanui and cordanui.config and cordanui.config.api_key and cordanui.config.api_key ~= "" then
-      key = cordanui.config.api_key
-    end
-  end
-  if not key or key == "" then
-    return nil, "missing api_key: backend not running and OPENCODE_API_KEY not set"
-  end
-  local base = cfg("base_url", "https://opencode.ai/zen/v1")
-  if base:sub(-1) == "/" then base = base:sub(1, -2) end
-  local body_ok, body = pcall(cordanui.json.encode, { model = model, messages = messages, temperature = 0.7 })
-  if not body_ok then return nil, "failed to encode request" end
-  local url = base .. "/chat/completions"
-  local ok, res = pcall(cordanui.http.request, {
-    url = url,
-    method = "POST",
-    headers = { ["content-type"] = "application/json", ["authorization"] = "Bearer " .. key },
-    body = body,
-  })
-  if not ok then return nil, "chat request failed: " .. tostring(res) end
-  if not res or res.status ~= 200 then
-    local snippet = res and res.body and res.body:sub(1, 200) or ""
-    return nil, "chat failed HTTP " .. tostring(res and res.status or "unknown") .. ": " .. snippet
-  end
-  local pok, parsed = pcall(cordanui.json.decode, res.body)
-  if not pok or not parsed then return nil, "invalid JSON response" end
-  local content = nil
-  if parsed.choices and parsed.choices[1] and parsed.choices[1].message and parsed.choices[1].message.content ~= nil then
-    content = parsed.choices[1].message.content
-  elseif parsed.content and type(parsed.content) == "string" then
-    content = parsed.content
-  end
-  if content == nil then return nil, "missing content in response" end
-  return content, parsed.usage
-end
-
 local function do_llm_request()
   local model = selected_model or cfg("default_model", "grok-code") or "grok-code"
   local messages = build_messages()
 
   local content, usage_or_err = viaBackend(model, messages)
   if not content then
-    local err = usage_or_err
-    -- if backend gave an error (e.g. missing api_key: configure provider-zen), surface it and don't silently fallback
-    -- but if backend was simply not running (viaBackend returned nil with no error), try direct
-    local backend_running = false
-    if cord and cord.services and cord.services.is_running then
-      local ok, r = pcall(cord.services.is_running, "cordanui-agents")
-      backend_running = ok and r
-    end
-    if backend_running then
-      -- backend was running but returned error → show it
-      local msg = err or "backend error"
-      if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-      if cordanui and cordanui.log then pcall(cordanui.log.error, "cordanui-chat viaBackend: " .. msg) end
-      sending = false
-      -- invalidate models cache on unknown model
-      if msg and msg:find("unknown model") then cached_models = nil end
-      return
-    end
-    -- backend not running → fallback direct
-    if cordanui and cordanui.log then pcall(cordanui.log.info, "cordanui-chat: backend not running, trying direct HTTP") end
-    content, usage_or_err = do_direct_http(model, messages)
-    if not content then
-      local msg = usage_or_err or "direct request failed"
-      if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
-      if cordanui and cordanui.log then pcall(cordanui.log.error, msg) end
-      sending = false
-      return
-    end
+    local msg = usage_or_err or "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
+    if cordanui and cordanui.log then pcall(cordanui.log.error, "cordanui-chat viaBackend: " .. msg) end
+    sending = false
+    -- invalidate models cache on unknown model so next /model re-fetches
+    if msg and msg:find("unknown model") then cached_models = nil end
+    return
   end
 
   history[#history + 1] = { role = "assistant", content = content, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
@@ -362,6 +315,13 @@ end
 local function openChat()
   load_history()
   load_model()
+  -- auto-start on open if not running (covers case where plugin was installed before agents backend existed)
+  pcall(function()
+    if cord and cord.services and cord.services.is_running and cord.services.start then
+      local ok, running = pcall(cord.services.is_running, "cordanui-agents")
+      if ok and not running then pcall(cord.services.start, "cordanui-agents") end
+    end
+  end)
   -- pre-warm models cache (non-blocking best effort)
   pcall(getModels)
   if cord and cord.ui and cord.ui.show_panel then
