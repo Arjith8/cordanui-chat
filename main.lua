@@ -225,6 +225,9 @@ local function do_llm_request()
   local content, usage_or_err = viaBackend(model, messages)
   if not content then
     local msg = usage_or_err or "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+    -- surface in panel history so it's copyable (y) and survives notify clobber
+    history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+    save_history()
     if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
     if cordanui and cordanui.log then pcall(cordanui.log.error, "cordanui-chat viaBackend: " .. msg) end
     sending = false
@@ -380,9 +383,15 @@ local function openChat()
   end)
   -- pre-warm models cache (best effort) — result folded into final return
   local prewarm_ok, prewarm_models = pcall(getModels)
-  if prewarm_ok and prewarm_models and #prewarm_models > 0 then
+  local is_provider_list = prewarm_ok and prewarm_models and #prewarm_models > 0 and not (#prewarm_models == 1 and prewarm_models[1].id == "cordanui-agents")
+  if is_provider_list then
     backend_status = backend_status .. " — " .. #prewarm_models .. " model(s)"
-  elseif backend_status:find("not running") then
+  elseif prewarm_ok and prewarm_models and (#prewarm_models == 0 or (#prewarm_models == 1 and prewarm_models[1].id == "cordanui-agents")) and backend_status:find("active") then
+    backend_status = backend_status .. " — no providers (install provider plugin + set api_key)"
+    if cord and cord.ui and cord.ui.notify then
+      pcall(cord.ui.notify, { message = "hey you haven't set anything up pls do that first — no provider configured — install/activate a provider plugin (e.g. opencode-zen-provider) and set its api_key in plugin settings", level = "warn" })
+    end
+  elseif backend_status:find("not running") or backend_status:find("unavailable") then
     backend_status = backend_status .. " — no models (backend down)"
   end
   if cord and cord.ui and cord.ui.show_panel then
