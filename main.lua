@@ -96,12 +96,12 @@ local function save_model(m)
 end
 
 -- ---------------------------------------------------------------------------
--- @ mentions: @1-6, @<id>, @<id>-<id> -> assign to agent via cord.goals
+-- @ mentions: @1-6 / @<sno>-<sno> (sno = serial, 1-based visible order; uuid fallback) -> assign to agent via cord.goals
 -- ---------------------------------------------------------------------------
 local function handle_mentions(text)
   if not (cord and cord.goals and cord.goals.assign) then return {} end
   local assigned = {}
-  -- Numeric range @1-6
+  -- Numeric sno range @1-6 (preferred over uuid)
   for s, e in text:gmatch("@(%d+)%-(%d+)") do
     local ok, ids = pcall(cord.goals.assign_range, s, e, { model = selected_model })
     if ok and ids and #ids > 0 then
@@ -111,20 +111,20 @@ local function handle_mentions(text)
       pcall(cord.ui.notify, { message = "assign @" .. s .. "-" .. e .. " failed: " .. tostring(ids), level = "error" })
     end
   end
-  -- Single @id or @1 (not part of range)
+  -- Single @sno or @<id> (not part of range) — sno (serial, 1-based) preferred, uuid fallback
   local text_no_ranges = text:gsub("@%d+%-%d+", "")
   for id in text_no_ranges:gmatch("@([%w%.%-_]+)") do
-    -- Try as full ID first, then as numeric index
-    local ok, _ = pcall(cord.goals.assign, id, { model = selected_model })
-    if ok then
-      table.insert(assigned, id)
-      pcall(cord.ui.notify, { message = "assigned @" .. id .. " to agent", level = "info" })
+    local ok_sno, ids_sno = pcall(cord.goals.assign_range, id, id, { model = selected_model })
+    if ok_sno and ids_sno and #ids_sno > 0 then
+      for _, nid in ipairs(ids_sno) do table.insert(assigned, nid) end
+      pcall(cord.ui.notify, { message = "assigned @" .. id .. " (sno) to agent", level = "info" })
     else
-      -- Try as numeric single via range
-      local ok2, ids2 = pcall(cord.goals.assign_range, id, id, { model = selected_model })
-      if ok2 and ids2 and #ids2 > 0 then
-        for _, nid in ipairs(ids2) do table.insert(assigned, nid) end
+      local ok, _ = pcall(cord.goals.assign, id, { model = selected_model })
+      if ok then
+        table.insert(assigned, id)
         pcall(cord.ui.notify, { message = "assigned @" .. id .. " to agent", level = "info" })
+      else
+        pcall(cord.ui.notify, { message = "assign @" .. id .. " failed: not found", level = "warn" })
       end
     end
   end
@@ -506,10 +506,10 @@ local function assignCommand()
     if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "cord.goals not available — update host to get @1-6 assign", level = "error" }) end
     return "cord.goals not available"
   end
-  -- prompt for range: supports @1-6 numeric and @<id>-<id> dotted ids (also bare 1-6)
+  -- prompt for range: supports @1-6 / @<sno>-<sno> (sno = serial, visible order; uuid dotted fallback; bare 1-6 also ok)
   local range = nil
   if cord and cord.ui and cord.ui.input then
-    local ok, val = pcall(cord.ui.input, { title = "Assign to agent", placeholder = "@1-6 or @<id>-<id> (bare 1-6 also ok)", prefill = "@" })
+    local ok, val = pcall(cord.ui.input, { title = "Assign to agent", placeholder = "@1-6 or @<sno>-<sno> (sno=serial; uuid fallback)", prefill = "@" })
     if not ok then return "assign cancelled: " .. tostring(val) end
     range = val
   else
@@ -535,7 +535,7 @@ plugin.commands = {
   ["cordanui-chat.open"] = { run = openChat, desc = "Open chat (buffer tab)" },
   ["cordanui-chat.clear"] = { run = clearChat, desc = "Clear history" },
   ["cordanui-chat.model"] = { run = pickModel, desc = "Pick model (from cordanui-agents /models)" },
-  ["cordanui-chat.assign"] = { run = assignCommand, desc = "Assign @1-6 / @<id>-<id> range to agent" },
+  ["cordanui-chat.assign"] = { run = assignCommand, desc = "Assign @1-6 / @<sno>-<sno> range to agent (sno=serial)" },
 }
 
 return plugin

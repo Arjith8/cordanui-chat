@@ -16,7 +16,7 @@ title = "Chat"
 text = """
 Run `cordanui-chat.open` from <leader>; (command palette) — opens Chat buffer tab (not popup).
 Type message, Enter sends, Esc deselects buffer. History persists via settings and syncs via Turso.
-Mentions: @1-6 or @<id>-<id> in any message auto-assigns that range to agent with current model.
+Mentions: @1-6 or @<sno>-<sno> (sno=serial, visible order; uuid fallback) in any message auto-assigns that range to agent with current model.
 Commands: cordanui-chat.clear, .model, .assign (range picker). Models from cordanui-agents GET /models.
 """
 
@@ -27,5 +27,5 @@ text = "Enter send · Esc deselect buffer · Backspace delete · /clear wipe · 
 [[help]]
 title = "Assign"
 text = """
-cordanui-chat.assign from <leader>; prompts for @1-6 or @<id>-<id>. Also typing @1-6 / @<id>-<id> inside a chat message while sending auto-assigns via cord.goals.assign_range with your selected model (shown in header). Direct goals-page assign: <leader>A or bare @ in TUI, long-press → Assign in mobile.
+cordanui-chat.assign from <leader>; prompts for @1-6 or @<sno>-<sno> (sno=serial). Also typing @1-6 / @<sno>-<sno> (uuid fallback) inside a chat message while sending auto-assigns via cord.goals.assign_range with your selected model (shown in header). Direct goals-page assign: <leader>A or bare @ in TUI, long-press → Assign in mobile.
 """
