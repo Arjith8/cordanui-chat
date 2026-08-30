@@ -479,14 +479,21 @@ local chat_buffer_id = nil
 
 local function on_key(key)
   if key == "esc" then
-    -- Esc now does nothing (was closing buffer and hanging) - use q to close
+    -- Esc now does nothing per request
     return true
   end
   if key == "q" and draft == "" then
     sending = false
     pending_llm = false
     pending_file = nil
-    return false
+    -- Close whichever surface we are on (panel or buffer) - non-blocking
+    pcall(function()
+      if cord and cord.ui and cord.ui.close_panel then cord.ui.close_panel() end
+    end)
+    pcall(function()
+      if cord and cord.buffers and cord.buffers.select then cord.buffers.select(nil) end
+    end)
+    return true
   end
 
   -- inline dropdown navigation (not popups) for / and @
@@ -655,11 +662,17 @@ local function openChat()
   elseif backend_status:find("not running") or backend_status:find("unavailable") then
     backend_status = backend_status .. " — no models (backend down)"
   end
-  -- Prefer buffer (sheet-tab, Claude Code/Codex style) — host built this after
-  -- the original chat spec (which used popup panel). Fallback to panel for
-  -- older hosts / headless tests.
+  -- Chat now uses a dedicated panel (completely separate from sheet/buffer tabs)
+  -- to avoid the "stuck in place" issue where buffer shared rendering with goals.
   local opened_via = nil
-  if cord and cord.buffers and cord.buffers.create and cord.buffers.select then
+  if cord and cord.ui and cord.ui.show_panel then
+    cord.ui.show_panel{
+      title = "Chat — cordanui-chat",
+      draw = draw,
+      on_key = on_key,
+    }
+    opened_via = "panel"
+  elseif cord and cord.buffers and cord.buffers.create and cord.buffers.select then
     local ok, id = pcall(cord.buffers.create, { name = "Chat", draw = draw, on_key = on_key })
     if ok and id then
       chat_buffer_id = id
@@ -668,14 +681,6 @@ local function openChat()
     else
       if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: cord.buffers.create failed: " .. tostring(id)) end
     end
-  end
-  if not opened_via and cord and cord.ui and cord.ui.show_panel then
-    cord.ui.show_panel{
-      title = "Chat — cordanui-chat",
-      draw = draw,
-      on_key = on_key,
-    }
-    opened_via = "panel"
   end
   if not opened_via then
     if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: no UI surface available (headless)") end
@@ -745,7 +750,7 @@ local function assignCommand()
 end
 
 plugin.commands = {
-  ["cordanui-chat.open"] = { run = openChat, desc = "Open chat (buffer tab)" },
+  ["cordanui-chat.open"] = { run = openChat, desc = "Open chat (dedicated panel)" },
   ["cordanui-chat.clear"] = { run = clearChat, desc = "Clear history" },
   ["cordanui-chat.model"] = { run = pickModel, desc = "Pick model (from cordanui-agents /models)" },
   ["cordanui-chat.assign"] = { run = assignCommand, desc = "Assign @1-6 / @<sno>-<sno> range to agent (sno=serial)" },

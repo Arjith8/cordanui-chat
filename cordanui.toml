@@ -14,8 +14,8 @@ theme = false
 [[help]]
 title = "Chat"
 text = """
-Run `cordanui-chat.open` from <leader>; (command palette) — opens Chat buffer tab (not popup).
-Type message, Enter sends, q (when draft empty) closes buffer. History persists via settings and syncs via Turso.
+Run `cordanui-chat.open` from <leader>; (command palette) — opens Chat panel (dedicated overlay, separate from goals/buffers).
+Type message, Enter sends, q (when draft empty) closes. Esc does nothing. History persists via settings and syncs via Turso.
 Mentions: @1-6 or @<sno>-<sno> (sno=serial, visible order; uuid fallback) in any message auto-assigns that range to agent with current model.
 Commands: cordanui-chat.clear, .model, .assign (range picker). Models from cordanui-agents GET /models.
 """
