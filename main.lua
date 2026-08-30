@@ -501,10 +501,41 @@ local function pickModel()
   return "cancelled"
 end
 
+local function assignCommand()
+  if not (cord and cord.goals and cord.goals.assign_range) then
+    if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "cord.goals not available — update host to get @1-6 assign", level = "error" }) end
+    return "cord.goals not available"
+  end
+  -- prompt for range: supports @1-6 numeric and @<id>-<id> dotted ids (also bare 1-6)
+  local range = nil
+  if cord and cord.ui and cord.ui.input then
+    local ok, val = pcall(cord.ui.input, { title = "Assign to agent", placeholder = "@1-6 or @<id>-<id> (bare 1-6 also ok)", prefill = "@" })
+    if not ok then return "assign cancelled: " .. tostring(val) end
+    range = val
+  else
+    return "assign requires cord.ui.input (headless: use @1-6 inside chat message)"
+  end
+  if not range or range:match("^%s*$") then return "cancelled" end
+  range = range:gsub("^%s+", ""):gsub("%s+$", "")
+  -- normalize bare 1-6 -> @1-6 so handle_mentions finds it
+  if not range:find("@") then
+    if range:match("^%d+%s*%-%s*%d+$") or range:match("^%d+$") or range:match("^[%w%.%-_]+%s*%-%s*[%w%.%-_]+$") or range:match("^[%w%.%-_]+$") then
+      range = "@" .. range:gsub("%s+", "")
+    end
+  end
+  local assigned = handle_mentions(range)
+  if assigned and #assigned > 0 then
+    return "assigned " .. #assigned .. " task(s) " .. range .. " to agent [" .. (selected_model or cfg("default_model", "grok-code") or "grok-code") .. "]"
+  else
+    return "no tasks matched " .. range
+  end
+end
+
 plugin.commands = {
-  ["cordanui-chat.open"] = { run = openChat, desc = "Open chat" },
+  ["cordanui-chat.open"] = { run = openChat, desc = "Open chat (buffer tab)" },
   ["cordanui-chat.clear"] = { run = clearChat, desc = "Clear history" },
   ["cordanui-chat.model"] = { run = pickModel, desc = "Pick model (from cordanui-agents /models)" },
+  ["cordanui-chat.assign"] = { run = assignCommand, desc = "Assign @1-6 / @<id>-<id> range to agent" },
 }
 
 return plugin
