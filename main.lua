@@ -27,6 +27,11 @@ local cached_at = 0
 local spinner_tick = 0
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
+-- suggestion dropdown state (not popups, inline lists)
+local suggest_idx = 1
+local suggest_type = nil -- "slash" | "mention" | nil
+local slash_cmds = { "/clear", "/model", "/help" }
+
 -- ---------------------------------------------------------------------------
 -- helpers: config
 -- ---------------------------------------------------------------------------
@@ -129,6 +134,54 @@ local function handle_mentions(text)
     end
   end
   return assigned
+end
+
+-- ---------------------------------------------------------------------------
+-- suggestion dropdowns (inline, not popups) for / cmds and @ mentions
+-- ---------------------------------------------------------------------------
+local function slashCandidates()
+  if draft:sub(1, 1) ~= "/" then return nil end
+  local prefix = draft:lower()
+  local out = {}
+  for _, c in ipairs(slash_cmds) do
+    if c:sub(1, #prefix) == prefix then table.insert(out, c) end
+  end
+  -- also "/" alone shows all
+  if #out == 0 then return nil end
+  return out
+end
+
+local function mentionCandidates()
+  if draft:sub(1, 1) == "/" then return nil end
+  local at_pos = draft:match(".*()@")
+  if not at_pos then return nil end
+  local token = draft:sub(at_pos + 1)
+  if token:find("%s") then return nil end
+  -- token may be "1", "1-6", "abc", ""; empty means show all
+  local ok, goals = pcall(function()
+    if not (cord and cord.goals and cord.goals.list) then return {} end
+    local ok2, list = pcall(cord.goals.list)
+    if ok2 and type(list) == "table" then return list else return {} end
+  end)
+  if not ok or type(goals) ~= "table" or #goals == 0 then return nil end
+  local filter = token:match("^([^%-]+)") or token
+  filter = filter:lower()
+  local out = {}
+  for _, g in ipairs(goals) do
+    local sno = tostring(g.index or "")
+    local id = g.id or ""
+    local title = g.title or ""
+    local status = g.status or ""
+    local match = false
+    if filter == "" then match = true
+    elseif sno:lower():find(filter, 1, true) or id:lower():find(filter, 1, true) or title:lower():find(filter, 1, true) then match = true end
+    if match then
+      table.insert(out, { display = sno .. ": " .. title .. " [" .. status .. "]", insert = "@" .. sno .. " ", sno = sno, id = id })
+      if #out >= 8 then break end
+    end
+  end
+  if #out == 0 then return nil end
+  return out
 end
 
 -- ---------------------------------------------------------------------------
@@ -294,7 +347,7 @@ local function draw()
     local frame = SPINNER[(spinner_tick % #SPINNER) + 1]
     header = frame .. " Chat (" .. #history .. " msgs) [" .. model_label .. "] — thinking..."
   else
-    header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, Esc close, /clear wipe, /model pick"
+    header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, Esc deselect, / for cmds, @ for sno"
   end
   local draft_line
   if sending then
@@ -304,11 +357,38 @@ local function draw()
   else
     draft_line = { content = "> " .. draft .. "▏", fg = "secondary" }
   end
-  return {
+  -- inline dropdowns (not popups)
+  local slash = slashCandidates()
+  local mention = slash and nil or mentionCandidates()
+  local widgets = {
     { content = header, fg = "primary", bold = true },
     { items = items, highlight = #items > 0 and #items or nil },
-    draft_line,
   }
+  if slash then
+    suggest_type = "slash"
+    if suggest_idx > #slash then suggest_idx = #slash end
+    if suggest_idx < 1 then suggest_idx = 1 end
+    local disp = {}
+    for _, c in ipairs(slash) do disp[#disp + 1] = c .. " — slash cmd" end
+    table.insert(widgets, { content = " / commands (↑↓ navigate, Tab complete, Enter run):", fg = "tertiary" })
+    table.insert(widgets, { items = disp, highlight = suggest_idx })
+  elseif mention then
+    suggest_type = "mention"
+    if suggest_idx > #mention then suggest_idx = #mention end
+    if suggest_idx < 1 then suggest_idx = 1 end
+    local disp = {}
+    for _, m in ipairs(mention) do disp[#disp + 1] = m.display end
+    table.insert(widgets, { content = " @ sno (↑↓ navigate, Tab complete):", fg = "tertiary" })
+    table.insert(widgets, { items = disp, highlight = suggest_idx })
+  else
+    suggest_type = nil
+    suggest_idx = 1
+  end
+  table.insert(widgets, draft_line)
+  if not slash and not mention and draft ~= "" and draft:sub(1, 1) ~= "/" and not draft:find("@") then
+    table.insert(widgets, { content = " tip: type / for cmds or @<sno> to assign", fg = "tertiary" })
+  end
+  return widgets
 end
 
 local chat_buffer_id = nil
@@ -324,12 +404,51 @@ local function on_key(key)
     return true
   end
 
+  -- inline dropdown navigation (not popups) for / and @
+  do
+    local slash = slashCandidates()
+    local mention = slash and nil or mentionCandidates()
+    local has = (slash and #slash > 0) or (mention and #mention > 0)
+    if has then
+      if key == "up" then
+        suggest_idx = math.max(1, suggest_idx - 1)
+        return true
+      elseif key == "down" then
+        local max = slash and #slash or #mention
+        suggest_idx = math.min(max, suggest_idx + 1)
+        return true
+      elseif key == "tab" or key == "shift+tab" then
+        if slash then
+          draft = slash[suggest_idx] or draft
+          return true
+        elseif mention then
+          local sel = mention[suggest_idx]
+          if sel and sel.insert then
+            local at_pos = draft:match(".*()@")
+            if at_pos then draft = draft:sub(1, at_pos) .. sel.insert
+            else draft = draft .. sel.insert end
+          end
+          return true
+        end
+      end
+    end
+  end
+
   if key == "enter" then
     if sending then return true end
     if draft == "" then return true end
 
+    -- if slash dropdown visible, Enter completes partial prefix to highlighted suggestion
     -- slash commands
     if draft:sub(1, 1) == "/" then
+      do
+        local sc = slashCandidates()
+        if sc and #sc > 0 then
+          local exact = false
+          for _, c in ipairs(sc) do if c == draft then exact = true break end end
+          if not exact then draft = sc[suggest_idx] or sc[1] end
+        end
+      end
       if draft == "/clear" then
         history = {}
         save_history()
@@ -355,9 +474,13 @@ local function on_key(key)
           if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "pick not available in panel — use <leader>; cordanui-chat.model", level = "warn" }) end
         end
         return true
+      elseif draft == "/help" then
+        if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "/clear wipe history · /model pick model (↑↓ Tab complete) · @<sno> assign sno range, Tab completes") end
+        draft = ""
+        return true
       else
         if cord and cord.ui and cord.ui.notify then
-          pcall(cord.ui.notify, { message = "unknown command: " .. draft, level = "warn" })
+          pcall(cord.ui.notify, { message = "unknown command: " .. draft .. " (try /help)", level = "warn" })
         end
         draft = ""
         return true
@@ -379,16 +502,19 @@ local function on_key(key)
 
   if key == "backspace" then
     if #draft > 0 then draft = draft:sub(1, -2) end
+    suggest_idx = 1
     return true
   end
 
   if #key == 1 then
     draft = draft .. key
+    suggest_idx = 1
     return true
   end
 
   if key == "space" then
     draft = draft .. " "
+    suggest_idx = 1
     return true
   end
 

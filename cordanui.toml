@@ -22,7 +22,7 @@ Commands: cordanui-chat.clear, .model, .assign (range picker). Models from corda
 
 [[help]]
 title = "Keys"
-text = "Enter send · Esc deselect buffer · Backspace delete · /clear wipe · /model pick · @1-6 assign"
+text = "Enter send · Esc deselect buffer · Backspace delete · /clear wipe · /model pick · @1-6 assign · / ↑↓ Tab dropdown · @ ↑↓ Tab dropdown (sno, not popup)"
 
 [[help]]
 title = "Assign"
