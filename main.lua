@@ -486,12 +486,7 @@ local function on_key(key)
     sending = false
     pending_llm = false
     pending_file = nil
-    pcall(function()
-      if cord and cord.buffers and cord.buffers.select then
-        cord.buffers.select(nil)
-      end
-    end)
-    return true
+    return false
   end
 
   -- inline dropdown navigation (not popups) for / and @
