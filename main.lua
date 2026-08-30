@@ -21,6 +21,7 @@ end)
 local history = {}
 local draft = ""
 local sending = false
+local pending_llm = false
 local selected_model = nil
 local cached_models = nil
 local cached_at = 0
@@ -282,60 +283,143 @@ local function build_messages()
 end
 
 -- chat → backend: backend injects api_key from settings, chat only sends model+messages
--- returns nil, err where err explains if backend not active vs backend error
-local function viaBackend(model, messages)
+-- background thread/process so UI stays responsive (loader animates)
+local pending_file = nil
+local pending_start = 0
+
+local function check_backend_running()
   if not (cord and cord.services and cord.services.is_running) then
-    return nil, "agent backend not active: cord.services unavailable"
+    return false, "agent backend not active: cord.services unavailable"
   end
   local ok_running, running = pcall(cord.services.is_running, "cordanui-agents")
   if not (ok_running and running) then
-    return nil, "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
+    return false, "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
   end
+  return true, nil
+end
 
-  local ok, res = pcall(cord.services.request, "cordanui-agents", {
-    method = "POST",
-    path = "/chat",
-    headers = { ["content-type"] = "application/json" },
-    body = { model = model, messages = messages, temperature = 0.7 },
-  })
-  if not ok or not res then return nil, "backend request failed: " .. tostring(res) end
-  if res.status ~= 200 then return nil, "backend HTTP " .. tostring(res.status) end
-  local ok2, parsed = pcall(cordanui.json.decode, res.body)
-  if not ok2 then return nil, "invalid JSON from backend" end
+local function spawn_via_backend_async(model, messages)
+  local ok, running = check_backend_running()
+  if not ok then
+    return false, running
+  end
+  -- use curl in background so panel stays responsive
+  local body_ok, body = pcall(cordanui.json.encode, { model = model, messages = messages, temperature = 0.7 })
+  if not body_ok or not body then
+    return false, "failed to encode request"
+  end
+  -- check curl exists
+  if os.execute("command -v curl > /dev/null 2>&1") ~= 0 then
+    return false, "curl not found - please install curl"
+  end
+  -- temp file for response
+  local tmp = os.tmpname()
+  pending_file = tmp
+  pending_start = os.time()
+  -- escape single quotes for shell
+  local esc_body = body:gsub("'", "'\\''")
+  -- curl to backend's /chat (addr http://127.0.0.1:8081 per cordanui-agents manifest)
+  -- --max-time 120 matches host timeout, -s silent, -o file, & background
+  -- on curl failure, write error JSON so poll doesn't wait 130s
+  local url = "http://127.0.0.1:8081/chat"
+  local cmd = string.format("curl -s -X POST '%s' -H 'Content-Type: application/json' -d '%s' -o '%s' --max-time 120 || echo '{\"error\":\"curl failed: backend not reachable\"}' > '%s' &", url, esc_body, tmp, tmp)
+  local exec_ok = os.execute(cmd)
+  if cordanui and cordanui.log then
+    pcall(cordanui.log.info, "cordanui-chat spawn curl: " .. cmd .. " ok=" .. tostring(exec_ok))
+  end
+  return true, nil
+end
+
+local function poll_pending_async()
+  if not pending_file or not sending then return end
+  local f = io.open(pending_file, "r")
+  if not f then
+    -- file not yet created (curl hasn't started) — check timeout
+    if os.time() - pending_start > 130 then
+      history[#history + 1] = { role = "assistant", content = "⚠ timeout waiting for backend", at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+      save_history()
+      sending = false
+      pending_file = nil
+      pcall(cord.ui.notify, { message = "chat timeout", level = "error" })
+    end
+    return
+  end
+  local content = f:read("*a")
+  f:close()
+  -- curl creates file immediately empty, then fills when done.
+  -- If file is empty, still waiting.
+  if not content or content == "" then
+    if os.time() - pending_start > 130 then
+      history[#history + 1] = { role = "assistant", content = "⚠ timeout waiting for backend", at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+      save_history()
+      sending = false
+      os.remove(pending_file)
+      pending_file = nil
+      pcall(cord.ui.notify, { message = "chat timeout", level = "error" })
+    end
+    return
+  end
+  -- got response
+  os.remove(pending_file)
+  pending_file = nil
+  local ok2, parsed = pcall(cordanui.json.decode, content)
+  if not ok2 or not parsed then
+    local msg = "invalid JSON from backend"
+    history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+    save_history()
+    sending = false
+    pcall(cord.ui.notify, { message = msg, level = "error" })
+    return
+  end
   if parsed.error then
     local detail = parsed.detail and (": " .. parsed.detail) or ""
-    return nil, parsed.error .. detail
+    local msg = parsed.error .. detail
+    history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+    save_history()
+    sending = false
+    pcall(cord.ui.notify, { message = msg, level = "error" })
+    if msg and msg:find("unknown model") then cached_models = nil end
+    return
   end
-  return parsed.content, parsed.usage
+  local out = parsed.content or ""
+  history[#history + 1] = { role = "assistant", content = out, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+  save_history()
+  sending = false
 end
 
 local function do_llm_request()
   local model = selected_model or cfg("default_model", "grok-code") or "grok-code"
   local messages = build_messages()
-
-  local content, usage_or_err = viaBackend(model, messages)
-  if not content then
-    local msg = usage_or_err or "agent backend not active: cordanui-agents is not running — start it via `cordanui service start cordanui-agents` or TUI with --with-agents"
-    -- surface in panel history so it's copyable (y) and survives notify clobber
+  local ok, err = spawn_via_backend_async(model, messages)
+  if not ok then
+    local msg = err or "agent backend not active"
     history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
     save_history()
     if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = msg, level = "error" }) end
     if cordanui and cordanui.log then pcall(cordanui.log.error, "cordanui-chat viaBackend: " .. msg) end
     sending = false
-    -- invalidate models cache on unknown model so next /model re-fetches
+    pending_file = nil
     if msg and msg:find("unknown model") then cached_models = nil end
     return
   end
-
-  history[#history + 1] = { role = "assistant", content = content, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
-  save_history()
-  sending = false
+  -- keep sending true; poll will clear it when file arrives
 end
 
 -- ---------------------------------------------------------------------------
 -- panel
 -- ---------------------------------------------------------------------------
 local function draw()
+  -- if a send was queued in on_key, kick off the LLM now that one frame of
+  -- spinner has already been drawn - this makes the loader visible
+  if pending_llm and sending then
+    pending_llm = false
+    -- run in pcall so errors still clear sending; this now spawns curl in background (&)
+    pcall(do_llm_request)
+  end
+  -- poll background curl result - non-blocking, keeps spinner animating
+  if pending_file and sending then
+    pcall(poll_pending_async)
+  end
   if sending then spinner_tick = spinner_tick + 1 end
   local items = {}
   for _, m in ipairs(history) do
@@ -345,9 +429,9 @@ local function draw()
   local header
   if sending then
     local frame = SPINNER[(spinner_tick % #SPINNER) + 1]
-    header = frame .. " Chat (" .. #history .. " msgs) [" .. model_label .. "] — thinking..."
+    header = frame .. " Chat (" .. #history .. " msgs) [" .. model_label .. "] — thinking... (q to cancel)"
   else
-    header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, Esc deselect, / for cmds, @ for sno"
+    header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, q close (when empty), / for cmds, @ for sno"
   end
   local draft_line
   if sending then
@@ -395,12 +479,18 @@ local chat_buffer_id = nil
 
 local function on_key(key)
   if key == "esc" then
-    -- Buffer mode: deselect to go back to goals (buffer stays alive for next open)
-    if cord and cord.buffers and cord.buffers.select then
-      pcall(cord.buffers.select, nil)
-    elseif cord and cord.ui and cord.ui.close_panel then
-      pcall(cord.ui.close_panel)
-    end
+    -- Esc now does nothing (was closing buffer and hanging) - use q to close
+    return true
+  end
+  if key == "q" and draft == "" then
+    sending = false
+    pending_llm = false
+    pending_file = nil
+    pcall(function()
+      if cord and cord.buffers and cord.buffers.select then
+        cord.buffers.select(nil)
+      end
+    end)
     return true
   end
 
@@ -490,13 +580,13 @@ local function on_key(key)
     -- @ mentions -> assign tasks to agent (e.g. @1-6, @<id>-<id>, @<id>)
     pcall(handle_mentions, draft)
 
-    -- push user message
+    -- push user message - defer LLM to next draw so spinner is visible
     local at = os.date("!%Y-%m-%dT%H:%M:%SZ")
     history[#history + 1] = { role = "user", content = draft, at = at }
     draft = ""
     sending = true
+    pending_llm = true
     save_history()
-    do_llm_request()
     return true
   end
 
@@ -604,6 +694,8 @@ local function clearChat()
   if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "history cleared") end
   draft = ""
   sending = false
+  pending_llm = false
+  if pending_file then pcall(os.remove, pending_file) pending_file = nil end
   return "history cleared"
 end
 
