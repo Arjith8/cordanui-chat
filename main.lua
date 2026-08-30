@@ -308,24 +308,76 @@ local function spawn_via_backend_async(model, messages)
   if not body_ok or not body then
     return false, "failed to encode request"
   end
-  -- check curl exists
-  if os.execute("command -v curl > /dev/null 2>&1") ~= 0 then
-    return false, "curl not found - please install curl"
-  end
   -- temp file for response
   local tmp = os.tmpname()
-  pending_file = tmp
-  pending_start = os.time()
   -- escape single quotes for shell
   local esc_body = body:gsub("'", "'\\''")
-  -- curl to backend's /chat (addr http://127.0.0.1:8081 per cordanui-agents manifest)
-  -- --max-time 120 matches host timeout, -s silent, -o file, & background
-  -- on curl failure, write error JSON so poll doesn't wait 130s
   local url = "http://127.0.0.1:8081/chat"
-  local cmd = string.format("curl -s -X POST '%s' -H 'Content-Type: application/json' -d '%s' -o '%s' --max-time 120 || echo '{\"error\":\"curl failed: backend not reachable\"}' > '%s' &", url, esc_body, tmp, tmp)
+  -- try curl, then wget, then fallback to blocking cord.services.request
+  local has_curl = os.execute("command -v curl > /dev/null 2>&1") == 0
+  local has_wget = os.execute("command -v wget > /dev/null 2>&1") == 0
+  local cmd = nil
+  if has_curl then
+    pending_file = tmp
+    pending_start = os.time()
+    cmd = string.format("curl -s -X POST '%s' -H 'Content-Type: application/json' -d '%s' -o '%s' --max-time 120 || echo '{\"error\":\"curl failed: backend not reachable\"}' > '%s' &", url, esc_body, tmp, tmp)
+  elseif has_wget then
+    pending_file = tmp
+    pending_start = os.time()
+    -- wget -qO- to stdout then redirect, --timeout 120
+    cmd = string.format("wget -qO- --timeout=120 --header='Content-Type: application/json' --post-data='%s' '%s' > '%s' 2>/dev/null || echo '{\"error\":\"wget failed: backend not reachable\"}' > '%s' &", esc_body, url, tmp, tmp)
+  else
+    -- no curl/wget - fallback to blocking host request (will briefly block UI but works without external deps)
+    if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: curl/wget not found, falling back to blocking cord.services.request") end
+    local ok, res = pcall(cord.services.request, "cordanui-agents", {
+      method = "POST",
+      path = "/chat",
+      headers = { ["content-type"] = "application/json" },
+      body = { model = model, messages = messages, temperature = 0.7 },
+    })
+    if not ok or not res then
+      local msg = "backend request failed: " .. tostring(res)
+      history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+      save_history()
+      sending = false
+      pcall(cord.ui.notify, { message = msg, level = "error" })
+      return true, nil
+    end
+    if res.status ~= 200 then
+      local msg = "backend HTTP " .. tostring(res.status)
+      history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+      save_history()
+      sending = false
+      pcall(cord.ui.notify, { message = msg, level = "error" })
+      return true, nil
+    end
+    local ok2, parsed = pcall(cordanui.json.decode, res.body)
+    if not ok2 or not parsed then
+      local msg = "invalid JSON from backend"
+      history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+      save_history()
+      sending = false
+      pcall(cord.ui.notify, { message = msg, level = "error" })
+      return true, nil
+    end
+    if parsed.error then
+      local detail = parsed.detail and (": " .. parsed.detail) or ""
+      local msg = parsed.error .. detail
+      history[#history + 1] = { role = "assistant", content = "⚠ " .. msg, at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+      save_history()
+      sending = false
+      pcall(cord.ui.notify, { message = msg, level = "error" })
+      if msg and msg:find("unknown model") then cached_models = nil end
+      return true, nil
+    end
+    history[#history + 1] = { role = "assistant", content = parsed.content or "", at = os.date("!%Y-%m-%dT%H:%M:%SZ") }
+    save_history()
+    sending = false
+    return true, nil
+  end
   local exec_ok = os.execute(cmd)
   if cordanui and cordanui.log then
-    pcall(cordanui.log.info, "cordanui-chat spawn curl: " .. cmd .. " ok=" .. tostring(exec_ok))
+    pcall(cordanui.log.info, "cordanui-chat spawn: " .. cmd .. " ok=" .. tostring(exec_ok))
   end
   return true, nil
 end
