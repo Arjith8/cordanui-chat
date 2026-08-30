@@ -24,6 +24,8 @@ local sending = false
 local selected_model = nil
 local cached_models = nil
 local cached_at = 0
+local spinner_tick = 0
+local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
 -- ---------------------------------------------------------------------------
 -- helpers: config
@@ -91,6 +93,42 @@ local function save_model(m)
   if cord and cord.config and cord.config.set then
     pcall(cord.config.set, "chat.model", m)
   end
+end
+
+-- ---------------------------------------------------------------------------
+-- @ mentions: @1-6, @<id>, @<id>-<id> -> assign to agent via cord.goals
+-- ---------------------------------------------------------------------------
+local function handle_mentions(text)
+  if not (cord and cord.goals and cord.goals.assign) then return {} end
+  local assigned = {}
+  -- Numeric range @1-6
+  for s, e in text:gmatch("@(%d+)%-(%d+)") do
+    local ok, ids = pcall(cord.goals.assign_range, s, e, { model = selected_model })
+    if ok and ids and #ids > 0 then
+      for _, id in ipairs(ids) do table.insert(assigned, id) end
+      pcall(cord.ui.notify, { message = "assigned @" .. s .. "-" .. e .. " (" .. #ids .. " tasks) to agent", level = "info" })
+    elseif not ok then
+      pcall(cord.ui.notify, { message = "assign @" .. s .. "-" .. e .. " failed: " .. tostring(ids), level = "error" })
+    end
+  end
+  -- Single @id or @1 (not part of range)
+  local text_no_ranges = text:gsub("@%d+%-%d+", "")
+  for id in text_no_ranges:gmatch("@([%w%.%-_]+)") do
+    -- Try as full ID first, then as numeric index
+    local ok, _ = pcall(cord.goals.assign, id, { model = selected_model })
+    if ok then
+      table.insert(assigned, id)
+      pcall(cord.ui.notify, { message = "assigned @" .. id .. " to agent", level = "info" })
+    else
+      -- Try as numeric single via range
+      local ok2, ids2 = pcall(cord.goals.assign_range, id, id, { model = selected_model })
+      if ok2 and ids2 and #ids2 > 0 then
+        for _, nid in ipairs(ids2) do table.insert(assigned, nid) end
+        pcall(cord.ui.notify, { message = "assigned @" .. id .. " to agent", level = "info" })
+      end
+    end
+  end
+  return assigned
 end
 
 -- ---------------------------------------------------------------------------
@@ -245,17 +283,26 @@ end
 -- panel
 -- ---------------------------------------------------------------------------
 local function draw()
+  if sending then spinner_tick = spinner_tick + 1 end
   local items = {}
   for _, m in ipairs(history) do
     items[#items + 1] = m.role .. ": " .. m.content
   end
   local model_label = selected_model or cfg("default_model", "grok-code")
-  local header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, Esc close, /clear wipe, /model pick"
+  local header
+  if sending then
+    local frame = SPINNER[(spinner_tick % #SPINNER) + 1]
+    header = frame .. " Chat (" .. #history .. " msgs) [" .. model_label .. "] — thinking..."
+  else
+    header = "Chat (" .. #history .. " msgs) [" .. model_label .. "] — Enter send, Esc close, /clear wipe, /model pick"
+  end
   local draft_line
   if sending then
-    draft_line = { content = "...thinking...", fg = "tertiary" }
+    local frame = SPINNER[(spinner_tick % #SPINNER) + 1]
+    local dots = string.rep(".", (spinner_tick % 3) + 1)
+    draft_line = { content = frame .. " thinking" .. dots .. " (" .. model_label .. ")", fg = "tertiary", bold = true }
   else
-    draft_line = { content = "> " .. draft, fg = "secondary" }
+    draft_line = { content = "> " .. draft .. "▏", fg = "secondary" }
   end
   return {
     { content = header, fg = "primary", bold = true },
@@ -264,9 +311,16 @@ local function draw()
   }
 end
 
+local chat_buffer_id = nil
+
 local function on_key(key)
   if key == "esc" then
-    if cord and cord.ui and cord.ui.close_panel then pcall(cord.ui.close_panel) end
+    -- Buffer mode: deselect to go back to goals (buffer stays alive for next open)
+    if cord and cord.buffers and cord.buffers.select then
+      pcall(cord.buffers.select, nil)
+    elseif cord and cord.ui and cord.ui.close_panel then
+      pcall(cord.ui.close_panel)
+    end
     return true
   end
 
@@ -290,22 +344,15 @@ local function on_key(key)
           if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat /model: getModels returned empty") end
           return true
         end
-        local items = {}
-        for _, m in ipairs(models) do items[#items + 1] = m.display or m.id or tostring(m) end
-        if #items == 0 then
-          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "no models available", level = "warn" }) end
-          return true
-        end
-        if cord and cord.ui and cord.ui.pick then
-          local ok, idx = pcall(cord.ui.pick, { title = "Model", items = items })
-          if not ok then
-            if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "pick failed: " .. tostring(idx), level = "error" }) end
-          elseif idx and models[idx] then
-            save_model(models[idx].id)
-            if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "model: " .. models[idx].id) end
-          end
+        -- Panel on_key is sync (no Tokio reactor) — cord.ui.pick is async and
+        -- would panic "no reactor running" if called here. Use first model
+        -- directly; full picker is available via <leader>; cordanui-chat.model
+        local first = models[1]
+        if first and first.id then
+          save_model(first.id)
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, "model: " .. first.id .. " (use <leader>; cordanui-chat.model for picker)") end
         else
-          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "pick not available (headless). models: " .. table.concat(items, ", "), level = "warn" }) end
+          if cord and cord.ui and cord.ui.notify then pcall(cord.ui.notify, { message = "pick not available in panel — use <leader>; cordanui-chat.model", level = "warn" }) end
         end
         return true
       else
@@ -316,6 +363,9 @@ local function on_key(key)
         return true
       end
     end
+
+    -- @ mentions -> assign tasks to agent (e.g. @1-6, @<id>-<id>, @<id>)
+    pcall(handle_mentions, draft)
 
     -- push user message
     local at = os.date("!%Y-%m-%dT%H:%M:%SZ")
@@ -394,16 +444,32 @@ local function openChat()
   elseif backend_status:find("not running") or backend_status:find("unavailable") then
     backend_status = backend_status .. " — no models (backend down)"
   end
-  if cord and cord.ui and cord.ui.show_panel then
+  -- Prefer buffer (sheet-tab, Claude Code/Codex style) — host built this after
+  -- the original chat spec (which used popup panel). Fallback to panel for
+  -- older hosts / headless tests.
+  local opened_via = nil
+  if cord and cord.buffers and cord.buffers.create and cord.buffers.select then
+    local ok, id = pcall(cord.buffers.create, { name = "Chat", draw = draw, on_key = on_key })
+    if ok and id then
+      chat_buffer_id = id
+      pcall(cord.buffers.select, id)
+      opened_via = "buffer"
+    else
+      if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: cord.buffers.create failed: " .. tostring(id)) end
+    end
+  end
+  if not opened_via and cord and cord.ui and cord.ui.show_panel then
     cord.ui.show_panel{
       title = "Chat — cordanui-chat",
       draw = draw,
       on_key = on_key,
     }
-  else
-    if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: cord.ui.show_panel not available (headless)") end
+    opened_via = "panel"
   end
-  return "chat opened — " .. backend_status
+  if not opened_via then
+    if cordanui and cordanui.log then pcall(cordanui.log.warn, "cordanui-chat: no UI surface available (headless)") end
+  end
+  return "chat opened — " .. backend_status .. (opened_via and (" (" .. opened_via .. ")") or "")
 end
 
 local function clearChat()
